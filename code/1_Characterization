@@ -1,0 +1,519 @@
+# ============================================================
+# TABLE 1 — FOUR-GROUP DEMOGRAPHIC CHARACTERIZATION
+# Unified formatted table (publication-ready)
+# ReDLat Cohort — Epigenetic Aging Study
+# Groups: Dem_CR | Dem_NonCR | Con_CR | Con_NonCR
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from scipy.stats import chi2_contingency, f as f_dist
+from statsmodels.stats.multitest import multipletests
+from itertools import combinations
+try:
+    import pingouin as pg
+    _HAS_PINGOUIN = True
+except ImportError:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pingouin', '-q',
+                           '--break-system-packages'])
+    import pingouin as pg
+    _HAS_PINGOUIN = True
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, numbers
+from openpyxl.utils import get_column_letter
+import warnings
+warnings.filterwarnings('ignore')
+
+# ── Mount Drive and load data ─────────────────────────────────────
+from google.colab import drive, files
+drive.mount('/content/drive')
+
+DATA_PATH   = '/content/drive/MyDrive/Doctorado/Epi_cr3x.csv'
+OUTPUT_FILE = 'Table1_FourGroups.xlsx'
+
+df = pd.read_csv(DATA_PATH)
+print(f"Data loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+
+# ── Step 1: Cognitive classification ─────────────────────────────
+df['cog_status'] = np.nan
+df.loc[df['clinical_diagnosis'].isin(['AD', 'FTD']), 'cog_status'] = 'Dementia'
+df.loc[df['clinical_diagnosis'] == 'CN',             'cog_status'] = 'Control'
+
+# ── Step 2: Verify cardiomet_risk consistency ─────────────────────
+cardio_components    = ['cardio_risk', 'cardio_dis', 'demo_smoke', 'demo_smoke_current']
+available_components = [c for c in cardio_components if c in df.columns]
+
+for col in available_components + ['cardiomet_risk', 'other_comorb', 'without_comorb']:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+df['_any_cardio'] = df[available_components].eq(1).any(axis=1).astype(int)
+mask_inconsistent = (df['_any_cardio'] == 1) & (df['cardiomet_risk'] != 1)
+n_corrected = mask_inconsistent.sum()
+if n_corrected > 0:
+    df.loc[mask_inconsistent, 'cardiomet_risk'] = 1
+    print(f"Warning: {n_corrected} participants corrected (component=1 but cardiomet_risk≠1).")
+else:
+    print("cardiomet_risk is consistent. No corrections needed.")
+df.drop(columns=['_any_cardio'], inplace=True)
+
+# ── Step 3: Assign four groups ────────────────────────────────────
+def assign_four_groups(row):
+    cog = row['cog_status']
+    cr  = row['cardiomet_risk']
+    oc  = row['other_comorb']
+    wc  = row['without_comorb']
+    if cog == 'Dementia':
+        if cr == 1:             return 'Dem_CR'
+        if oc == 1 or wc == 1: return 'Dem_NonCR'
+    elif cog == 'Control':
+        if cr == 1:             return 'Con_CR'
+        if oc == 1 or wc == 1: return 'Con_NonCR'
+    return None
+
+df['Group'] = df.apply(assign_four_groups, axis=1)
+df4 = df[df['Group'].notna()].copy()
+# Analysis order (used for stats): Dem_CR, Dem_NonCR, Con_CR, Con_NonCR
+GROUP_ORDER  = ['Dem_CR', 'Dem_NonCR', 'Con_CR', 'Con_NonCR']
+# Display order (matches two-level header: CR block | NonCR block)
+DATA_COL_ORDER = ['Dem_CR', 'Con_CR', 'Dem_NonCR', 'Con_NonCR']
+GROUP_LABELS = {
+    'Dem_CR':    'Dementia\nCardiometabolic Risk',
+    'Dem_NonCR': 'Dementia\nNon-Cardiometabolic Risk',
+    'Con_CR':    'Controls\nCardiometabolic Risk',
+    'Con_NonCR': 'Controls\nNon-Cardiometabolic Risk',
+}
+SUPERSCRIPTS = {'Dem_CR': 'ᵃ', 'Dem_NonCR': 'ᵇ', 'Con_CR': 'ᶜ', 'Con_NonCR': 'ᵈ'}
+
+group_n = {g: (df4['Group'] == g).sum() for g in GROUP_ORDER}
+total_n = len(df4)
+
+print(f"\nGroup distribution:")
+for g in GROUP_ORDER:
+    pct = group_n[g] / total_n * 100
+    print(f"  {g:<12}: n = {group_n[g]} ({pct:.1f}%)")
+
+# ── Helper functions ──────────────────────────────────────────────
+def cramers_v(chi2, n, dof):
+    k = dof + 1  # approximate number of categories
+    return np.sqrt(chi2 / (n * max(k - 1, 1)))
+
+def eta_squared_welch(F, df_between, df_within):
+    """Eta squared from Welch ANOVA F statistic."""
+    ss_between = F * df_between
+    ss_total   = ss_between + df_within
+    return ss_between / ss_total if ss_total > 0 else np.nan
+
+def posthoc_games_howell(data_by_group, groups):
+    """Games-Howell post-hoc via pingouin; returns set of significantly different pairs."""
+    rows = []
+    for g in groups:
+        for val in data_by_group[g]:
+            rows.append({'group': g, 'value': val})
+    df_ph = pd.DataFrame(rows)
+    try:
+        gh = pg.pairwise_gameshowell(data=df_ph, dv='value', between='group')
+        sig_pairs = set()
+        for _, row in gh.iterrows():
+            if row['pval'] < 0.05:
+                sig_pairs.add((row['A'], row['B']))
+                sig_pairs.add((row['B'], row['A']))
+        return sig_pairs
+    except Exception as e:
+        print(f"  Games-Howell error: {e}")
+        return set()
+
+def get_superscripts(group, sig_pairs, groups):
+    """Return superscript letters for groups significantly different from this one."""
+    sups = ''
+    for other in groups:
+        if other != group and (group, other) in sig_pairs:
+            sups += SUPERSCRIPTS[other]
+    return sups
+
+def posthoc_chi2_fdr(df_in, group_col, var, groups):
+    pairs = list(combinations(groups, 2))
+    p_values, results = [], []
+    for g1, g2 in pairs:
+        dp = df_in[df_in[group_col].isin([g1, g2])]
+        try:
+            ct = pd.crosstab(dp[group_col], dp[var])
+            _, p, _, _ = chi2_contingency(ct)
+            p_values.append(p)
+            results.append({'g1': g1, 'g2': g2, 'p_raw': p})
+        except:
+            p_values.append(1.0)
+            results.append({'g1': g1, 'g2': g2, 'p_raw': 1.0})
+    reject, p_adj, _, _ = multipletests(p_values, alpha=0.05, method='fdr_bh')
+    sig_pairs = set()
+    for i, r in enumerate(results):
+        if reject[i]:
+            sig_pairs.add((r['g1'], r['g2']))
+            sig_pairs.add((r['g2'], r['g1']))
+    return sig_pairs
+
+# ══════════════════════════════════════════════════════════════════
+# BUILD TABLE ROWS
+# Each row: [Variable, Dem_CR_val, Dem_NonCR_val, Con_CR_val, Con_NonCR_val, stat_str]
+# stat_str goes in a merged footer row below the variable block
+# ══════════════════════════════════════════════════════════════════
+table_rows = []  # list of dicts with keys: label, vals (list of 4), stat, row_type
+
+def add_section_header(title):
+    table_rows.append({'type': 'section', 'label': title})
+
+def add_subheader(title):
+    table_rows.append({'type': 'subheader', 'label': title})
+
+def add_data_row(label, vals, indent=True):
+    table_rows.append({'type': 'data', 'label': label, 'vals': vals, 'indent': indent})
+
+def add_stat_row(stat_str):
+    table_rows.append({'type': 'stat', 'label': stat_str})
+
+# ── Categorical variables ─────────────────────────────────────────
+add_section_header("Categorical Variables")
+add_subheader("n (%)")
+
+# Sex
+var = 'demo_sex'
+label = 'Sex, n (%)'
+if var in df4.columns:
+    ct = pd.crosstab(df4['Group'], df4[var])
+    chi2, p, dof, _ = chi2_contingency(ct)
+    V = cramers_v(chi2, total_n, dof)
+    sig_pairs = posthoc_chi2_fdr(df4, 'Group', var, GROUP_ORDER)
+
+    add_subheader(label)
+    cats = sorted(df4[var].dropna().unique())
+    cat_labels = {1: 'Female', 2: 'Male', 1.0: 'Female', 2.0: 'Male'}
+    for cat in cats:
+        vals = []
+        for g in DATA_COL_ORDER:
+            sub = df4[df4['Group'] == g]
+            n_cat = (sub[var] == cat).sum()
+            pct = n_cat / len(sub) * 100 if len(sub) > 0 else 0
+            sup = get_superscripts(g, sig_pairs, GROUP_ORDER)
+            vals.append(f"{n_cat} ({pct:.1f}%){sup}")
+        clabel = cat_labels.get(cat, str(int(cat)))
+        add_data_row(f"  {clabel}", vals)
+    sig_str = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
+    add_stat_row(f"χ²={chi2:.2f}; p={p:.3f}; V={V:.3f} {sig_str}")
+
+# Smoking — Dem_CR vs Con_CR only
+var = 'demo_smoke'
+if var in df4.columns:
+    df_cr = df4[df4['Group'].isin(['Dem_CR', 'Con_CR'])]
+    ct = pd.crosstab(df_cr['Group'], df_cr[var])
+    chi2, p, dof, _ = chi2_contingency(ct)
+    V = cramers_v(chi2, len(df_cr), dof)
+
+    add_subheader("Smoking history, n (%)")
+    cats = sorted(df4[var].dropna().unique())
+    smoke_labels = {0: 'No', 1: 'Yes', 0.0: 'No', 1.0: 'Yes'}
+    for cat in cats:
+        vals = []
+        for g in DATA_COL_ORDER:
+            if g in ['Dem_CR', 'Con_CR']:
+                sub = df4[df4['Group'] == g]
+                n_cat = (sub[var] == cat).sum()
+                pct = n_cat / len(sub) * 100 if len(sub) > 0 else 0
+                vals.append(f"{n_cat} ({pct:.1f}%)")
+            else:
+                vals.append("—")
+        clabel = smoke_labels.get(cat, str(int(cat)))
+        add_data_row(f"  {clabel}", vals)
+    sig_str = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
+    add_stat_row(f"χ²={chi2:.2f}; p={p:.3f}; V={V:.3f} {sig_str} (Dem_CR vs Con_CR only)")
+
+# Cardiometabolic medications — Dem_CR vs Con_CR only
+var = 'meds_rc'
+if var in df4.columns:
+    df_cr = df4[df4['Group'].isin(['Dem_CR', 'Con_CR'])]
+    ct = pd.crosstab(df_cr['Group'], df_cr[var])
+    chi2, p, dof, _ = chi2_contingency(ct)
+    V = cramers_v(chi2, len(df_cr), dof)
+
+    add_subheader("Cardiometabolic Medication Use, n (%)")
+    cats = sorted(df4[var].dropna().unique())
+    med_labels = {0: 'No', 1: 'Yes', 0.0: 'No', 1.0: 'Yes'}
+    for cat in cats:
+        vals = []
+        for g in DATA_COL_ORDER:
+            if g in ['Dem_CR', 'Con_CR']:
+                sub = df4[df4['Group'] == g]
+                n_cat = (sub[var] == cat).sum()
+                pct = n_cat / len(sub) * 100 if len(sub) > 0 else 0
+                vals.append(f"{n_cat} ({pct:.1f}%)")
+            else:
+                vals.append("—")
+        clabel = med_labels.get(cat, str(int(cat)))
+        add_data_row(f"  {clabel}", vals)
+    sig_str = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
+    add_stat_row(f"χ²={chi2:.2f}; p={p:.3f}; V={V:.3f} {sig_str} (Dem_CR vs Con_CR only)")
+
+# ── Continuous variables ──────────────────────────────────────────
+add_section_header("Continuous Variables")
+add_subheader("Mean (SD)")
+
+continuous_vars = {
+    'demo_age':   'Age',
+    'cog_ed':     'Years of Education',
+    't_adlq_tot': 'Functionality (T-ADLQ)',
+    'mmse_total': 'Cognitive function (MMSE)',
+}
+
+for var, label in continuous_vars.items():
+    if var not in df4.columns:
+        print(f"Warning: '{var}' not found -- skipped.")
+        continue
+
+    dbg = {g: pd.to_numeric(df4[df4['Group'] == g][var], errors='coerce').dropna()
+           for g in GROUP_ORDER}
+    vg  = [g for g in GROUP_ORDER if len(dbg[g]) >= 3]
+
+    # Welch ANOVA via pingouin
+    try:
+        rows_wa = []
+        for g in vg:
+            for val in dbg[g]:
+                rows_wa.append({'group': g, 'value': float(val)})
+        df_wa = pd.DataFrame(rows_wa)
+
+        wa = pg.welch_anova(data=df_wa, dv='value', between='group')
+        F   = float(wa['F'].iloc[0])
+        # pingouin column name varies by version
+        p_candidates = ['p_unc', 'p-unc', 'pval', 'p']
+        p_col = next((c for c in p_candidates if c in wa.columns), None)
+        if p_col is None:
+            raise KeyError(f"No p-value column found. Available: {list(wa.columns)}")
+        p   = float(wa[p_col].iloc[0])
+        # df columns also vary
+        # Use pingouin's np2 (partial eta squared) if available, else compute manually
+        if 'np2' in wa.columns:
+            eta2 = float(wa['np2'].iloc[0])
+        else:
+            df1_col = 'ddof1' if 'ddof1' in wa.columns else 'df'
+            df2_col = 'ddof2' if 'ddof2' in wa.columns else 'df2'
+            df1 = float(wa[df1_col].iloc[0]) if df1_col in wa.columns else float(len(vg) - 1)
+            df2 = float(wa[df2_col].iloc[0]) if df2_col in wa.columns else float(sum(len(dbg[g]) for g in vg) - len(vg))
+            eta2 = eta_squared_welch(F, df1, df2)
+        sig_str = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
+
+        # Games-Howell post-hoc
+        sig_pairs = posthoc_games_howell(dbg, vg)
+
+        # Build row values in display order: Dem_CR, Con_CR, Dem_NonCR, Con_NonCR
+        vals = []
+        for g in DATA_COL_ORDER:
+            d = dbg[g]
+            if len(d) == 0:
+                vals.append("--")
+                continue
+            sup = get_superscripts(g, sig_pairs, GROUP_ORDER)
+            vals.append(f"{np.mean(d):.1f} ({np.std(d):.1f}){sup}")
+
+        add_subheader(label)
+        add_data_row("  Mean (SD)", vals)
+        eta2_str = f"{eta2:.3f}" if not np.isnan(eta2) else "--"
+        add_stat_row(f"F={F:.2f}; p={p:.3f}; η²={eta2_str} {sig_str}")
+
+    except Exception as e:
+        print(f"  Error in {label}: {e}")
+
+# ══════════════════════════════════════════════════════════════════
+# WRITE EXCEL WITH FORMATTING
+# ══════════════════════════════════════════════════════════════════
+wb = Workbook()
+ws = wb.active
+ws.title = "Table 1"
+
+# ── Styles — black & white, Arial ────────────────────────────────
+WHITE = "FFFFFF"
+BLACK = "000000"
+
+FONT_NAME = "Times New Roman"
+
+def make_border(style='thin'):
+    s = Side(style=style)
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def make_fill(hex_color):
+    return PatternFill("solid", fgColor=hex_color)
+
+no_fill = PatternFill(fill_type=None)
+
+f_title   = Font(name=FONT_NAME, size=10)
+f_header  = Font(name=FONT_NAME, size=10, color=BLACK)
+f_subhdr  = Font(name=FONT_NAME, size=10)
+f_normal  = Font(name=FONT_NAME, size=10)
+f_stat    = Font(name=FONT_NAME, size=10)
+f_note    = Font(name=FONT_NAME, size=9)
+f_pct     = Font(name=FONT_NAME, size=9)
+
+thin_border   = make_border('thin')
+medium_border = make_border('medium')
+
+col_widths = [36, 24, 24, 24, 24]
+for i, w in enumerate(col_widths, 1):
+    ws.column_dimensions[get_column_letter(i)].width = w
+
+# ── Title row ────────────────────────────────────────────────────
+ws.merge_cells('A1:E1')
+title_cell = ws['A1']
+title_cell.value = "Table 1. Demographic and clinical characterization by group"
+title_cell.font  = f_title
+title_cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+ws.row_dimensions[1].height = 24
+
+# ── Row 2: two super-headers (CR / NonCR) ────────────────────────
+# Col A: "Characteristic" spans rows 2-4
+# Cols B-C: "Cardiometabolic Risk"
+# Cols D-E: "Non-Cardiometabolic Risk"
+ws.merge_cells('A2:A4')
+cell = ws.cell(row=2, column=1, value="Characteristic")
+cell.font      = f_header
+cell.fill      = no_fill
+cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+cell.border    = Border(top=Side(style='medium'), bottom=Side(style='thin'),
+                        left=Side(style='medium'), right=Side(style='thin'))
+
+ws.merge_cells('B2:C2')
+cell = ws.cell(row=2, column=2, value="Cardiometabolic Risk")
+cell.font      = f_header
+cell.fill      = no_fill
+cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+cell.border    = Border(top=Side(style='medium'), bottom=Side(style='thin'),
+                        left=Side(style='thin'), right=Side(style='thin'))
+
+ws.merge_cells('D2:E2')
+cell = ws.cell(row=2, column=4, value="Non-Cardiometabolic Risk")
+cell.font      = f_header
+cell.fill      = no_fill
+cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+cell.border    = Border(top=Side(style='medium'), bottom=Side(style='thin'),
+                        left=Side(style='thin'), right=Side(style='medium'))
+
+ws.row_dimensions[2].height = 20
+
+# ── Row 3: sub-headers (Dementia / Controls per group) ───────────
+sub_headers = [
+    (2, f"Dementia\n(n={group_n['Dem_CR']})"),
+    (3, f"Controls\n(n={group_n['Con_CR']})"),
+    (4, f"Dementia\n(n={group_n['Dem_NonCR']})"),
+    (5, f"Controls\n(n={group_n['Con_NonCR']})"),
+]
+for col, val in sub_headers:
+    cell = ws.cell(row=3, column=col, value=val)
+    cell.font      = f_header
+    cell.fill      = no_fill
+    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    left_s  = 'medium' if col in (2, 4) else 'thin'
+    right_s = 'medium' if col in (3, 5) else 'thin'
+    cell.border = Border(top=Side(style='thin'), bottom=Side(style='thin'),
+                         left=Side(style=left_s), right=Side(style=right_s))
+ws.row_dimensions[3].height = 30
+
+# ── Row 4: n (%) per group ────────────────────────────────────────
+# Col A already merged above; leave blank
+n_pct_order = ['Dem_CR', 'Con_CR', 'Dem_NonCR', 'Con_NonCR']
+for idx, g in enumerate(n_pct_order, 2):
+    cell = ws.cell(row=4, column=idx,
+                   value=f"n={group_n[g]} ({group_n[g]/total_n*100:.1f}%)")
+    cell.font      = f_pct
+    cell.fill      = no_fill
+    cell.alignment = Alignment(horizontal='center', vertical='center')
+    left_s  = 'medium' if idx in (2, 4) else 'thin'
+    right_s = 'medium' if idx in (3, 5) else 'thin'
+    cell.border = Border(top=Side(style='thin'), bottom=Side(style='medium'),
+                         left=Side(style=left_s), right=Side(style=right_s))
+ws.row_dimensions[4].height = 16
+
+current_row = 5
+
+# ── Write table rows ──────────────────────────────────────────────
+data_row_count = 0
+
+for row_dict in table_rows:
+    rtype = row_dict['type']
+
+    if rtype == 'section':
+        ws.merge_cells(f'A{current_row}:E{current_row}')
+        cell = ws.cell(row=current_row, column=1, value=row_dict['label'])
+        cell.font      = Font(name=FONT_NAME, size=10)
+        cell.fill      = no_fill
+        cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+        cell.border    = Border(top=Side(style='medium'), bottom=Side(style='thin'),
+                                left=Side(style='thin'), right=Side(style='thin'))
+        ws.row_dimensions[current_row].height = 18
+        current_row += 1
+
+    elif rtype == 'subheader':
+        ws.merge_cells(f'A{current_row}:E{current_row}')
+        cell = ws.cell(row=current_row, column=1, value=row_dict['label'])
+        cell.font      = f_subhdr
+        cell.fill      = no_fill
+        cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+        cell.border    = thin_border
+        ws.row_dimensions[current_row].height = 18
+        current_row += 1
+
+    elif rtype == 'data':
+        data_row_count += 1
+        indent = 2 if row_dict.get('indent', True) else 1
+
+        cell = ws.cell(row=current_row, column=1, value=row_dict['label'])
+        cell.font      = f_normal
+        cell.fill      = no_fill
+        cell.alignment = Alignment(horizontal='left', vertical='center', indent=indent)
+        cell.border    = thin_border
+
+        for col, val in enumerate(row_dict['vals'], 2):
+            cell = ws.cell(row=current_row, column=col, value=val)
+            cell.font      = f_normal
+            cell.fill      = no_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border    = thin_border
+
+        ws.row_dimensions[current_row].height = 20
+        current_row += 1
+
+    elif rtype == 'stat':
+        ws.merge_cells(f'A{current_row}:E{current_row}')
+        cell = ws.cell(row=current_row, column=1, value=row_dict['label'])
+        cell.font      = f_stat
+        cell.fill      = no_fill
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell.border    = Border(top=Side(style='thin'), bottom=Side(style='medium'),
+                                left=Side(style='thin'), right=Side(style='thin'))
+        ws.row_dimensions[current_row].height = 16
+        current_row += 1
+
+# ── Footer note ───────────────────────────────────────────────────
+ws.merge_cells(f'A{current_row}:E{current_row}')
+note = ("Superscripts indicate significant post-hoc differences: "
+        "ᵃ=Dementia Cardiometabolic Risk, ᵇ=Dementia Non-Cardiometabolic Risk, "
+        "ᶜ=Controls Cardiometabolic Risk, ᵈ=Controls Non-Cardiometabolic Risk. "
+        "Continuous variables analyzed with Welch ANOVA (justified by n>100 per group); "
+        "Games-Howell post-hoc for pairwise comparisons. "
+        "Categorical variables analyzed with Chi-square test. "
+        "Effect sizes: V = Cramér's V; η² = eta squared. "
+        "Smoking history and cardiometabolic medications compared only between CR groups "
+        "(defining components of the cardiometabolic risk group). "
+        "* p<0.05  ** p<0.01  *** p<0.001")
+cell = ws.cell(row=current_row, column=1, value=note)
+cell.font      = f_note
+cell.fill      = no_fill
+cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+cell.border    = Border(top=Side(style='medium'))
+ws.row_dimensions[current_row].height = 52
+
+# ── Freeze panes ──────────────────────────────────────────────────
+ws.freeze_panes = 'A3'
+
+# ── Save and download ─────────────────────────────────────────────
+wb.save(OUTPUT_FILE)
+print(f"\nFile ready: {OUTPUT_FILE}")
+files.download(OUTPUT_FILE)
+print("Download started.")
