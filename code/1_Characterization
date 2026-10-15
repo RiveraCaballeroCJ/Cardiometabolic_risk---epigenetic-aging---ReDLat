@@ -253,6 +253,37 @@ if var in df4.columns:
     sig_str = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
     add_stat_row(f"χ²={chi2:.2f}; p={p:.3f}; V={V:.3f} {sig_str} (Dem_CR vs Con_CR only)")
 
+# Country of residence — all four groups
+var = 'demo_resid'
+VALID_COUNTRIES = [1, 3, 4, 5, 6]
+country_labels  = {1: 'Argentina', 3: 'Chile', 4: 'Colombia', 5: 'Mexico', 6: 'Peru'}
+
+if var in df4.columns:
+    df4[var] = pd.to_numeric(df4[var], errors='coerce')
+    df4_country = df4[df4[var].isin(VALID_COUNTRIES)].copy()
+
+    ct = pd.crosstab(df4_country['Group'], df4_country[var])
+    chi2, p, dof, _ = chi2_contingency(ct)
+    V = cramers_v(chi2, len(df4_country), dof)
+    sig_pairs = posthoc_chi2_fdr(df4_country, 'Group', var, GROUP_ORDER)
+
+    add_subheader("Country of residence, n (%)")
+    total_country = len(df4_country)
+    for code in VALID_COUNTRIES:
+        n_total = (df4_country[var] == code).sum()
+        pct_total = n_total / total_country * 100 if total_country > 0 else 0
+        row_label = f"  {country_labels[code]}, {n_total} ({pct_total:.1f}%)"
+        vals = []
+        for g in DATA_COL_ORDER:
+            sub = df4_country[df4_country['Group'] == g]
+            n_cat = (sub[var] == code).sum()
+            pct = n_cat / len(sub) * 100 if len(sub) > 0 else 0
+            sup = get_superscripts(g, sig_pairs, GROUP_ORDER)
+            vals.append(f"{n_cat} ({pct:.1f}%){sup}")
+        add_data_row(row_label, vals)
+    sig_str = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
+    add_stat_row(f"χ²={chi2:.2f}; p={p:.3f}; V={V:.3f} {sig_str}")
+
 # ── Continuous variables ──────────────────────────────────────────
 add_section_header("Continuous Variables")
 add_subheader("Mean (SD)")
