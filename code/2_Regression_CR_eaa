@@ -1,0 +1,682 @@
+# ============================================================
+# MAIN ANALYSIS — Linear Mixed Models: CR → Epigenetic Age Acceleration
+# Predictor: cardiometabolic risk (CR vs. NonCR)
+# Covariates: age, sex, education, diagnosis, cardiometabolic meds
+# Random effect: country (demo_resid) — random intercept
+# FDR correction: Benjamini-Hochberg within each clock family
+# Effect size: partial eta squared (η²p)
+# Output: publication-ready Excel table (3 sheets: Table 2, Covariates, VIF)
+# ReDLat Cohort — Epigenetic Aging Study
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from scipy.stats import t as t_dist
+from statsmodels.regression.mixed_linear_model import MixedLM
+from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+import warnings
+warnings.filterwarnings('ignore')
+
+# ── Mount Drive and load data ─────────────────────────────────────
+from google.colab import drive, files
+drive.mount('/content/drive')
+
+DATA_PATH   = '/content/drive/MyDrive/Doctorado/Epi_cr3x.csv'
+OUTPUT_FILE = 'Table2_Regression_EAA.xlsx'
+
+df = pd.read_csv(DATA_PATH)
+print(f"Data loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+
+# ── Inclusion filters ─────────────────────────────────────────────
+VALID_COUNTRIES = [1, 3, 4, 5, 6]
+VALID_DIAGNOSES = ['AD', 'FTD', 'CN']
+
+df['demo_resid'] = pd.to_numeric(df['demo_resid'], errors='coerce')
+df = df[df['clinical_diagnosis'].isin(VALID_DIAGNOSES)].copy()
+df = df[df['demo_resid'].isin(VALID_COUNTRIES)].copy()
+print(f"Analytic sample: n = {len(df)}")
+
+# ── Recode predictors ─────────────────────────────────────────────
+cardio_components    = ['cardio_risk', 'cardio_dis', 'demo_smoke', 'demo_smoke_current']
+available_components = [c for c in cardio_components if c in df.columns]
+for col in available_components + ['cardiomet_risk', 'other_comorb', 'without_comorb']:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+df['_any_cardio'] = df[available_components].eq(1).any(axis=1).astype(int)
+mask_inconsistent = (df['_any_cardio'] == 1) & (df['cardiomet_risk'] != 1)
+if mask_inconsistent.sum() > 0:
+    df.loc[mask_inconsistent, 'cardiomet_risk'] = 1
+df.drop(columns=['_any_cardio'], inplace=True)
+
+def assign_group(row):
+    cog = row.get('cog_status', np.nan)
+    cr  = row['cardiomet_risk']
+    oc  = row['other_comorb']
+    wc  = row['without_comorb']
+    if cog == 'Dementia':
+        if cr == 1:             return 'CR'
+        if oc == 1 or wc == 1: return 'NonCR'
+    elif cog == 'Control':
+        if cr == 1:             return 'CR'
+        if oc == 1 or wc == 1: return 'NonCR'
+    return None
+
+df['cog_status'] = df['clinical_diagnosis'].map({'AD': 'Dementia', 'FTD': 'Dementia', 'CN': 'Control'})
+df['CR_binary'] = df.apply(assign_group, axis=1)
+df = df[df['CR_binary'].notna()].copy()
+df['CR_binary'] = (df['CR_binary'] == 'CR').astype(int)
+
+df['dementia'] = (df['cog_status'] == 'Dementia').astype(int)
+
+for col in ['demo_age', 'demo_sex', 'cog_ed', 'meds_rc']:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+df['country'] = df['demo_resid'].astype(int).astype(str)
+
+print(f"\nCR distribution: CR n={df['CR_binary'].sum()}, NonCR n={(df['CR_binary']==0).sum()}")
+print(f"Dementia: n={df['dementia'].sum()}, Controls: n={(df['dementia']==0).sum()}")
+
+# ── Clock families ────────────────────────────────────────────────
+clock_groups = {
+    'First/Second Generation': [
+        ('Horvath_EAA',    'Horvath'),
+        ('Hannum_EAA',     'Hannum'),
+        ('cAge_EAA',       'cAge'),
+        ('PhenoAge_EAA',   'PhenoAge'),
+        ('PCGrimAge_EAA',  'PCGrimAge'),
+    ],
+    'Next Generation': [
+        ('IntrinClock_EAA',   'IntrinClock'),
+        ('Retroclock_EAA',    'Retroclock'),
+        ('Retroclockv2_EAA',  'Retroclock v2'),
+        ('OMICmAge_EAA',      'OMICmAge'),
+        ('DNAmFitAge_EAA',    'DNAmFitAge'),
+        ('AdaptAge_EAA',      'AdaptAge'),
+        ('DamAge_EAA',        'DamAge'),
+        ('IntrinsicCapacity', 'IntrinsicCapacity'),
+        ('DunedinPACE',       'DunedinPACE'),
+    ],
+    'Organs/Systems': [
+        ('Blood_EAA',          'Blood'),
+        ('Brain_EAA',          'Brain'),
+        ('Heart_EAA',          'Heart'),
+        ('Lung_EAA',           'Lung'),
+        ('Liver_EAA',          'Liver'),
+        ('Kidney_EAA',         'Kidney'),
+        ('Immune_EAA',         'Immune'),
+        ('Inflammation_EAA',   'Inflammation'),
+        ('Hormone_EAA',        'Hormone'),
+        ('Metabolic_EAA',      'Metabolic'),
+        ('MusculoSkeletal_EAA','MusculoSkeletal'),
+        ('SystemsAge_EAA',     'SystemsAge'),
+    ],
+}
+
+COVARIATES = ['demo_age', 'demo_sex', 'cog_ed', 'dementia', 'meds_rc']
+COVARIATES = [c for c in COVARIATES if c in df.columns]
+
+COV_LABELS = {
+    'demo_age': 'Age',
+    'demo_sex': 'Sex',
+    'cog_ed':   'Years of education',
+    'dementia': 'Diagnosis (dementia)',
+    'meds_rc':  'Cardiometabolic medication',
+}
+
+# ── LMM function — returns full model results ─────────────────────
+def run_lmm(df_model, outcome, predictor, covariates, group_var):
+    """
+    Returns dict with:
+      - predictor results: beta_std, ci_low, ci_hi, p, partial_eta2, n
+      - covariate results: dict keyed by covariate name with same fields
+      - marginal R2 of the full model
+      - standardized predictor names (for VIF)
+      - fitted dff (for VIF computation)
+    """
+    cols_needed = [outcome, predictor] + covariates + [group_var]
+    dff = df_model[cols_needed].dropna().copy()
+
+    if len(dff) < 20:
+        return None
+
+    y_mean, y_std = dff[outcome].mean(), dff[outcome].std()
+    if y_std == 0:
+        return None
+    dff['y_std'] = (dff[outcome] - y_mean) / y_std
+
+    std_name_map = {}   # original col -> name used in formula
+    predictors_std = []
+    for col in [predictor] + covariates:
+        vals = dff[col]
+        if vals.nunique() > 2:
+            col_std = col + '_z'
+            col_mean, col_s = vals.mean(), vals.std()
+            dff[col_std] = (vals - col_mean) / col_s if col_s > 0 else 0.0
+            predictors_std.append(col_std)
+            std_name_map[col] = col_std
+        else:
+            predictors_std.append(col)
+            std_name_map[col] = col
+
+    formula_vars = ' + '.join(predictors_std)
+    try:
+        model  = MixedLM.from_formula(f'y_std ~ {formula_vars}', data=dff, groups=dff[group_var])
+        result = model.fit(reml=True, method='lbfgs')
+    except Exception as e:
+        print(f"  Model failed for {outcome}: {e}")
+        return None
+
+    def extract_param(col_orig):
+        name = std_name_map.get(col_orig, col_orig)
+        if name not in result.params.index:
+            matches = [k for k in result.params.index if col_orig in k]
+            if not matches:
+                return None
+            name = matches[0]
+        beta  = result.params[name]
+        se    = result.bse[name]
+        t_val = result.tvalues[name]
+        df_r  = result.df_resid if hasattr(result, 'df_resid') else len(dff) - len(result.params)
+        return {
+            'beta_std':     beta,
+            'ci_low':       beta - 1.96 * se,
+            'ci_hi':        beta + 1.96 * se,
+            'p':            result.pvalues[name],
+            'partial_eta2': t_val**2 / (t_val**2 + df_r) if df_r > 0 else np.nan,
+        }
+
+    pred_res = extract_param(predictor)
+    if pred_res is None:
+        return None
+
+    cov_res = {}
+    for cov in covariates:
+        cov_res[cov] = extract_param(cov)
+
+    # Marginal R² (Nakagawa & Schielzeth approximation for LMM)
+    # R²m = var(fixed) / (var(fixed) + var(random) + var(residual))
+    # NOTE: result.fittedvalues includes random effects; we need fixed-effects only
+    try:
+        import patsy
+        X_fixed    = patsy.dmatrix('~ ' + formula_vars, data=dff, return_type='dataframe')
+        fe_params  = result.fe_params
+        # Align columns in case patsy names differ slightly
+        common     = [c for c in X_fixed.columns if c in fe_params.index]
+        fixed_pred = X_fixed[common].values @ fe_params[common].values
+        var_fixed  = np.var(fixed_pred)
+        var_resid  = result.scale
+        var_random = float(result.cov_re.values[0][0]) if hasattr(result, 'cov_re') else 0.0
+        denom      = var_fixed + var_random + var_resid
+        marginal_r2 = var_fixed / denom if denom > 0 else np.nan
+    except Exception as e:
+        print(f"  R² failed for {outcome}: {e}")
+        marginal_r2 = np.nan
+
+    return {
+        'pred':         pred_res,
+        'covariates':   cov_res,
+        'marginal_r2':  marginal_r2,
+        'n':            len(dff),
+        'dff':          dff,
+        'predictors_std': predictors_std,
+    }
+
+# ── Run all models ────────────────────────────────────────────────
+all_results  = {}   # family -> list of result dicts (main predictor)
+all_cov_res  = {}   # family -> list (covariate results per clock)
+all_vif      = {}   # family -> list (VIF per clock)
+all_r2       = {}   # clock label -> marginal R²
+
+for family, clocks in clock_groups.items():
+    family_results = []
+    family_cov     = []
+    family_vif     = []
+
+    for col, label in clocks:
+        empty = {
+            'col': col, 'label': label,
+            'beta_std': np.nan, 'ci_low': np.nan, 'ci_hi': np.nan,
+            'p': np.nan, 'partial_eta2': np.nan, 'n': 0,
+        }
+        if col not in df.columns:
+            print(f"  Warning: '{col}' not found — skipped.")
+            family_results.append(empty)
+            family_cov.append({'col': col, 'label': label, 'covariates': {c: None for c in COVARIATES}})
+            family_vif.append({'col': col, 'label': label, 'vif': {}})
+            continue
+
+        res = run_lmm(df, col, 'CR_binary', COVARIATES, 'country')
+
+        if res is None:
+            family_results.append(empty)
+            family_cov.append({'col': col, 'label': label, 'covariates': {c: None for c in COVARIATES}})
+            family_vif.append({'col': col, 'label': label, 'vif': {}})
+        else:
+            family_results.append({'col': col, 'label': label, **res['pred'], 'n': res['n']})
+            family_cov.append({'col': col, 'label': label,
+                               'covariates': res['covariates'],
+                               'marginal_r2': res['marginal_r2']})
+            all_r2[label] = res['marginal_r2']
+
+            # VIF on standardized design matrix (predictors only, no intercept)
+            dff_vif = res['dff'][res['predictors_std']].dropna()
+            vif_dict = {}
+            try:
+                X_vif = dff_vif.values
+                for i, pname in enumerate(res['predictors_std']):
+                    vif_dict[pname] = variance_inflation_factor(X_vif, i)
+            except Exception:
+                for pname in res['predictors_std']:
+                    vif_dict[pname] = np.nan
+            family_vif.append({'col': col, 'label': label, 'vif': vif_dict,
+                               'predictors_std': res['predictors_std']})
+
+        print(f"  {label}: β={family_results[-1]['beta_std']:.3f}, p={family_results[-1]['p']:.4f}")
+
+    # FDR for main predictor within family
+    p_vals    = [r['p'] for r in family_results]
+    valid_idx = [i for i, p in enumerate(p_vals) if not np.isnan(p)]
+    p_fdr     = [np.nan] * len(family_results)
+    if valid_idx:
+        _, p_adj, _, _ = multipletests([p_vals[i] for i in valid_idx], alpha=0.05, method='fdr_bh')
+        for i, idx in enumerate(valid_idx):
+            p_fdr[idx] = p_adj[i]
+    for i, r in enumerate(family_results):
+        r['p_fdr'] = p_fdr[i]
+
+    # FDR for each covariate within family
+    for cov in COVARIATES:
+        cov_ps    = [fc['covariates'].get(cov, {}) or {} for fc in family_cov]
+        cov_pvals = [cp.get('p', np.nan) if cp else np.nan for cp in cov_ps]
+        valid_idx_c = [i for i, p in enumerate(cov_pvals) if not np.isnan(p)]
+        cov_pfdr = [np.nan] * len(family_cov)
+        if valid_idx_c:
+            _, p_adj_c, _, _ = multipletests([cov_pvals[i] for i in valid_idx_c], alpha=0.05, method='fdr_bh')
+            for i, idx in enumerate(valid_idx_c):
+                cov_pfdr[idx] = p_adj_c[i]
+        for i, fc in enumerate(family_cov):
+            if fc['covariates'].get(cov) is not None:
+                fc['covariates'][cov]['p_fdr'] = cov_pfdr[i]
+            elif fc['covariates'].get(cov) is None and cov in fc['covariates']:
+                pass  # already None
+
+    all_results[family] = family_results
+    all_cov_res[family] = family_cov
+    all_vif[family]     = family_vif
+    print(f"  [{family}] done\n")
+
+# ══════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════
+FONT_NAME = "Times New Roman"
+no_fill   = PatternFill(fill_type=None)
+
+f_title  = Font(name=FONT_NAME, size=10)
+f_header = Font(name=FONT_NAME, size=10)
+f_family = Font(name=FONT_NAME, size=10)
+f_normal = Font(name=FONT_NAME, size=10)
+f_note   = Font(name=FONT_NAME, size=9)
+
+def make_border(top='thin', bottom='thin', left='thin', right='thin'):
+    return Border(
+        top=Side(style=top), bottom=Side(style=bottom),
+        left=Side(style=left), right=Side(style=right)
+    )
+
+def sig_stars(p):
+    if np.isnan(p): return ''
+    if p < 0.001:   return '***'
+    if p < 0.01:    return '**'
+    if p < 0.05:    return '*'
+    return ''
+
+def fmt(val, decimals=3):
+    return f"{val:.{decimals}f}" if (val is not None and not np.isnan(val)) else "—"
+
+# ══════════════════════════════════════════════════════════════════
+# SHEET 1 — Table 2 (main predictor)
+# ══════════════════════════════════════════════════════════════════
+wb = Workbook()
+ws = wb.active
+ws.title = "Table 2"
+
+col_widths_main = [30, 12, 20, 10, 10, 10]
+for i, w in enumerate(col_widths_main, 1):
+    ws.column_dimensions[get_column_letter(i)].width = w
+
+ws.merge_cells('A1:F1')
+cell = ws['A1']
+cell.value = ("Table 2. Association between cardiometabolic risk and epigenetic age acceleration: "
+              "linear mixed model results")
+cell.font      = f_title
+cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+ws.row_dimensions[1].height = 30
+
+headers_main = ['Epigenetic Age Acceleration', 'β (std)', '95% CI', 'p', 'p-FDR', 'η²p']
+for col, hdr in enumerate(headers_main, 1):
+    cell = ws.cell(row=2, column=col, value=hdr)
+    cell.font      = f_header
+    cell.fill      = no_fill
+    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    cell.border    = make_border(
+        top='medium', bottom='medium',
+        left='medium' if col == 1 else 'thin',
+        right='medium' if col == 6 else 'thin'
+    )
+ws.row_dimensions[2].height = 24
+
+current_row = 3
+
+for family, results in all_results.items():
+    ws.merge_cells(f'A{current_row}:F{current_row}')
+    cell = ws.cell(row=current_row, column=1, value=family)
+    cell.font      = f_family
+    cell.fill      = no_fill
+    cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+    cell.border    = make_border(top='medium', bottom='thin', left='thin', right='thin')
+    ws.row_dimensions[current_row].height = 18
+    current_row += 1
+
+    for r in results:
+        beta_str = fmt(r['beta_std'])
+        ci_str   = f"[{fmt(r['ci_low'])}, {fmt(r['ci_hi'])}]" if not np.isnan(r['ci_low']) else "—"
+        p_str    = f"{fmt(r['p'])}{sig_stars(r['p'])}"
+        pfdr_str = f"{fmt(r['p_fdr'])}{sig_stars(r['p_fdr'])}"
+        eta_str  = fmt(r['partial_eta2'])
+        is_sig   = (not np.isnan(r['p_fdr'])) and (r['p_fdr'] < 0.05)
+
+        for col, val in enumerate([f"  {r['label']}", beta_str, ci_str, p_str, pfdr_str, eta_str], 1):
+            cell = ws.cell(row=current_row, column=col, value=val)
+            cell.font      = f_normal
+            cell.fill      = no_fill
+            cell.alignment = Alignment(
+                horizontal='left' if col == 1 else 'center',
+                vertical='center', wrap_text=True
+            )
+            cell.border = make_border(
+                left='medium' if col == 1 else 'thin',
+                right='medium' if col == 6 else 'thin'
+            )
+        ws.row_dimensions[current_row].height = 18
+        current_row += 1
+
+    for col in range(1, 7):
+        cell = ws.cell(row=current_row - 1, column=col)
+        cell.border = Border(
+            top=cell.border.top, bottom=Side(style='medium'),
+            left=cell.border.left, right=cell.border.right
+        )
+
+ws.merge_cells(f'A{current_row}:F{current_row}')
+note_main = (
+    "β (std) = standardized regression coefficient for cardiometabolic risk (cardiometabolic risk vs. "
+    "no cardiometabolic risk), derived from a linear mixed model with random intercept for country. "
+    "Covariates: age, sex, years of education, cognitive diagnosis (dementia vs. control), "
+    "and cardiometabolic medication use. "
+    "95% CI = 95% confidence interval. "
+    "p-FDR = p-value adjusted for multiple comparisons (Benjamini-Hochberg), applied separately "
+    "within each clock family. "
+    "η²p = partial eta squared. "
+    "* p < .05   ** p < .01   *** p < .001"
+)
+cell = ws.cell(row=current_row, column=1, value=note_main)
+cell.font      = f_note
+cell.fill      = no_fill
+cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+cell.border    = Border(top=Side(style='medium'))
+ws.row_dimensions[current_row].height = 60
+ws.freeze_panes = 'A3'
+
+# ══════════════════════════════════════════════════════════════════
+# SHEET 2 — Covariates (supplementary)
+# Columns: EAA | Covariate | β (std) | 95% CI | p | p-FDR | η²p | R²
+# Rows: each clock repeated once per covariate, grouped by family
+# R² is the same for all covariate rows of the same clock
+# ══════════════════════════════════════════════════════════════════
+ws2 = wb.create_sheet(title="Covariates")
+
+# Build lookup: (family, clock_col) -> covariate results
+cov_lookup = {}
+for family, cov_list in all_cov_res.items():
+    for fc in cov_list:
+        cov_lookup[(family, fc['col'])] = fc
+
+N_COV_COLS = 8   # EAA | Covariate | β std | 95% CI | p | p-FDR | η²p | R²
+
+ws2.column_dimensions['A'].width = 22   # EAA clock
+ws2.column_dimensions['B'].width = 26   # Covariate
+ws2.column_dimensions['C'].width = 12   # β std
+ws2.column_dimensions['D'].width = 20   # 95% CI
+ws2.column_dimensions['E'].width = 10   # p
+ws2.column_dimensions['F'].width = 10   # p-FDR
+ws2.column_dimensions['G'].width = 10   # η²p
+ws2.column_dimensions['H'].width = 10   # R²
+
+# Title
+ws2.merge_cells('A1:H1')
+cell = ws2['A1']
+cell.value = ("Supplementary Table. Covariate effects and model fit from linear mixed models "
+              "predicting epigenetic age acceleration")
+cell.font      = f_title
+cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+ws2.row_dimensions[1].height = 30
+
+# Headers
+cov_headers = ['Epigenetic Age Acceleration', 'Covariate',
+               'β (std)', '95% CI', 'p', 'p-FDR', 'η²p', 'R²']
+for col, hdr in enumerate(cov_headers, 1):
+    cell = ws2.cell(row=2, column=col, value=hdr)
+    cell.font      = f_header
+    cell.fill      = no_fill
+    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    cell.border    = make_border(
+        top='medium', bottom='medium',
+        left='medium' if col == 1 else 'thin',
+        right='medium' if col == N_COV_COLS else 'thin'
+    )
+ws2.row_dimensions[2].height = 24
+
+current_row2 = 3
+
+for family, clocks in clock_groups.items():
+    # Family header
+    ws2.merge_cells(f'A{current_row2}:H{current_row2}')
+    cell = ws2.cell(row=current_row2, column=1, value=family)
+    cell.font      = f_family
+    cell.fill      = no_fill
+    cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+    cell.border    = make_border(top='medium', bottom='thin', left='thin', right='thin')
+    ws2.row_dimensions[current_row2].height = 18
+    current_row2 += 1
+
+    for col_name, label in clocks:
+        fc      = cov_lookup.get((family, col_name), {})
+        r2_val  = fc.get('marginal_r2', np.nan) if fc else np.nan
+        r2_str  = fmt(r2_val)
+
+        for cov_i, cov in enumerate(COVARIATES):
+            cov_label = COV_LABELS.get(cov, cov)
+            cov_data  = fc.get('covariates', {}).get(cov, None) if fc else None
+
+            # EAA label only on first covariate row of each clock
+            eaa_label = f"  {label}" if cov_i == 0 else ""
+
+            if cov_data:
+                beta_str = fmt(cov_data.get('beta_std', np.nan))
+                ci_lo    = cov_data.get('ci_low', np.nan)
+                ci_hi    = cov_data.get('ci_hi', np.nan)
+                ci_str   = f"[{fmt(ci_lo)}, {fmt(ci_hi)}]" if not np.isnan(ci_lo) else "—"
+                p_val    = cov_data.get('p', np.nan)
+                p_fdr    = cov_data.get('p_fdr', np.nan)
+                eta2     = cov_data.get('partial_eta2', np.nan)
+                p_str    = f"{fmt(p_val)}{sig_stars(p_val)}"
+                pfdr_str = f"{fmt(p_fdr)}{sig_stars(p_fdr)}"
+                eta_str  = fmt(eta2)
+            else:
+                beta_str = ci_str = p_str = pfdr_str = eta_str = "—"
+
+            # R² only on first covariate row of each clock
+            r2_cell = r2_str if cov_i == 0 else ""
+
+            row_vals = [eaa_label, cov_label, beta_str, ci_str, p_str, pfdr_str, eta_str, r2_cell]
+            for col_i, val in enumerate(row_vals, 1):
+                cell = ws2.cell(row=current_row2, column=col_i, value=val)
+                cell.font      = f_normal
+                cell.fill      = no_fill
+                cell.alignment = Alignment(
+                    horizontal='left' if col_i <= 2 else 'center',
+                    vertical='center', wrap_text=True
+                )
+                # Bottom border: thicker after last covariate of each clock
+                bot = 'medium' if cov_i == len(COVARIATES) - 1 else 'thin'
+                cell.border = make_border(
+                    bottom=bot,
+                    left='medium' if col_i == 1 else 'thin',
+                    right='medium' if col_i == N_COV_COLS else 'thin'
+                )
+            ws2.row_dimensions[current_row2].height = 16
+            current_row2 += 1
+
+# Footer note sheet 2
+ws2.merge_cells(f'A{current_row2}:H{current_row2}')
+note2 = (
+    "β (std) = standardized regression coefficient. Linear mixed models with random intercept for country. "
+    "p-FDR = Benjamini-Hochberg correction applied within each clock family, separately for each covariate. "
+    "R² = marginal R² of the full model (Nakagawa & Schielzeth approximation), shown once per clock. "
+    "* p < .05   ** p < .01   *** p < .001"
+)
+cell = ws2.cell(row=current_row2, column=1, value=note2)
+cell.font      = f_note
+cell.fill      = no_fill
+cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+cell.border    = Border(top=Side(style='medium'))
+ws2.row_dimensions[current_row2].height = 50
+ws2.freeze_panes = 'B3'
+
+# ══════════════════════════════════════════════════════════════════
+# SHEET 3 — VIF
+# Rows = clocks (grouped by family), columns = predictors
+# ══════════════════════════════════════════════════════════════════
+ws3 = wb.create_sheet(title="VIF")
+
+# Collect all predictor std names (CR_binary + covariates)
+# Map std names to readable labels
+vif_label_map = {
+    'CR_binary':    'Cardiometabolic risk',
+    'demo_age_z':   'Age',
+    'demo_sex':     'Sex',
+    'cog_ed_z':     'Years of education',
+    'dementia':     'Diagnosis (dementia)',
+    'meds_rc':      'Cardiometabolic medication',
+    'demo_age':     'Age',
+    'cog_ed':       'Years of education',
+}
+
+# Determine columns from first available VIF dict
+all_pred_names = []
+for family, vif_list in all_vif.items():
+    for fv in vif_list:
+        if fv.get('predictors_std'):
+            all_pred_names = fv['predictors_std']
+            break
+    if all_pred_names:
+        break
+
+N_VIF_COLS = 1 + len(all_pred_names)   # Clock label + one per predictor
+
+ws3.column_dimensions['A'].width = 28
+for i in range(2, N_VIF_COLS + 1):
+    ws3.column_dimensions[get_column_letter(i)].width = 22
+
+# Title
+ws3.merge_cells(f'A1:{get_column_letter(N_VIF_COLS)}1')
+cell = ws3['A1']
+cell.value = "Supplementary Table. Variance inflation factors (VIF) for each linear mixed model"
+cell.font      = f_title
+cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+ws3.row_dimensions[1].height = 24
+
+# Headers
+vif_headers = ['Epigenetic Age Acceleration'] + [vif_label_map.get(p, p) for p in all_pred_names]
+for col, hdr in enumerate(vif_headers, 1):
+    cell = ws3.cell(row=2, column=col, value=hdr)
+    cell.font      = f_header
+    cell.fill      = no_fill
+    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    cell.border    = make_border(
+        top='medium', bottom='medium',
+        left='medium' if col == 1 else 'thin',
+        right='medium' if col == N_VIF_COLS else 'thin'
+    )
+ws3.row_dimensions[2].height = 24
+
+current_row3 = 3
+
+for family, vif_list in all_vif.items():
+    ws3.merge_cells(f'A{current_row3}:{get_column_letter(N_VIF_COLS)}{current_row3}')
+    cell = ws3.cell(row=current_row3, column=1, value=family)
+    cell.font      = f_family
+    cell.fill      = no_fill
+    cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+    cell.border    = make_border(top='medium', bottom='thin', left='thin', right='thin')
+    ws3.row_dimensions[current_row3].height = 18
+    current_row3 += 1
+
+    for fv in vif_list:
+        row_vals = [f"  {fv['label']}"]
+        for pname in all_pred_names:
+            vif_val = fv['vif'].get(pname, np.nan)
+            # Flag VIF > 5 with asterisk
+            if not np.isnan(vif_val):
+                flag = ' †' if vif_val > 5 else ''
+                row_vals.append(f"{vif_val:.2f}{flag}")
+            else:
+                row_vals.append("—")
+
+        for col_i, val in enumerate(row_vals, 1):
+            cell = ws3.cell(row=current_row3, column=col_i, value=val)
+            cell.font      = f_normal
+            cell.fill      = no_fill
+            cell.alignment = Alignment(
+                horizontal='left' if col_i == 1 else 'center',
+                vertical='center'
+            )
+            cell.border = make_border(
+                left='medium' if col_i == 1 else 'thin',
+                right='medium' if col_i == N_VIF_COLS else 'thin'
+            )
+        ws3.row_dimensions[current_row3].height = 18
+        current_row3 += 1
+
+    for col_i in range(1, N_VIF_COLS + 1):
+        cell = ws3.cell(row=current_row3 - 1, column=col_i)
+        cell.border = Border(
+            top=cell.border.top, bottom=Side(style='medium'),
+            left=cell.border.left, right=cell.border.right
+        )
+
+# Footer note sheet 3
+ws3.merge_cells(f'A{current_row3}:{get_column_letter(N_VIF_COLS)}{current_row3}')
+note3 = (
+    "VIF = variance inflation factor computed from the standardized design matrix of each model. "
+    "VIF values above 5 are flagged with †; values above 10 indicate severe multicollinearity."
+)
+cell = ws3.cell(row=current_row3, column=1, value=note3)
+cell.font      = f_note
+cell.fill      = no_fill
+cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+cell.border    = Border(top=Side(style='medium'))
+ws3.row_dimensions[current_row3].height = 36
+ws3.freeze_panes = 'A3'
+
+# ── Save and download ─────────────────────────────────────────────
+wb.save(OUTPUT_FILE)
+print(f"\nFile ready: {OUTPUT_FILE}")
+files.download(OUTPUT_FILE)
+print("Download started.")
